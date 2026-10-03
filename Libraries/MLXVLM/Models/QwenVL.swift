@@ -215,9 +215,12 @@ public struct QwenVL {
         in promptTokens: [Int], frames: [THW], paddingToken: String, mergeSize: Int,
         tokenizer: any Tokenizer
     ) throws -> [Int] {
-        // Replace single padding token with correct number for each image or video frame
+        // Replace single padding token with correct number for each image or video frame.
+        // Encoded without special tokens: a tokenizer whose post-processor appends
+        // one (Qwen3-VL-Embedding appends <|endoftext|>) would otherwise produce a
+        // pattern that never occurs in the prompt.
         let placeholderTokens = tokenizer.encode(
-            text: "<|vision_start|>\(paddingToken)<|vision_end|>")
+            text: "<|vision_start|>\(paddingToken)<|vision_end|>", addSpecialTokens: false)
         let placeholderRanges = promptTokens.ranges(of: placeholderTokens)
         guard placeholderRanges.count == frames.count else {
             throw VLMError.processing(
@@ -228,8 +231,8 @@ public struct QwenVL {
             let paddingCount = frame.product / mergeLength
             return tokenizer.encode(
                 text:
-                    "<|vision_start|>\(Array(repeating: paddingToken, count: paddingCount).joined())<|vision_end|>"
-            )
+                    "<|vision_start|>\(Array(repeating: paddingToken, count: paddingCount).joined())<|vision_end|>",
+                addSpecialTokens: false)
         }
         // Build the final array
         var result: [Int] = []
