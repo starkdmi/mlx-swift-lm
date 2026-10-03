@@ -226,6 +226,11 @@ public struct LMOutput {
     /// logits (one hot vector of probabilities for tokens)
     public let logits: MLXArray
 
+    /// The last decoder layer's output after the final norm, `[B, L, hidden]`,
+    /// for models that expose it. Embedding models pool it; logits cannot be
+    /// mapped back to it.
+    public let hiddenStates: MLXArray?
+
     /// optional ``State`` to carry forward into the next step
     public let state: State?
 
@@ -283,8 +288,9 @@ public struct LMOutput {
         }
     }
 
-    public init(logits: MLXArray, state: LMOutput.State? = nil) {
+    public init(logits: MLXArray, hiddenStates: MLXArray? = nil, state: LMOutput.State? = nil) {
         self.logits = logits
+        self.hiddenStates = hiddenStates
         self.state = state
     }
 }

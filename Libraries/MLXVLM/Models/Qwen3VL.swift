@@ -1425,7 +1425,7 @@ enum Qwen3VLLanguage {
                 }
             }
 
-            var output = model(
+            let hiddenStates = model(
                 inputIds,
                 cache: cache,
                 inputEmbeddings: inputEmbeddings,
@@ -1434,13 +1434,14 @@ enum Qwen3VLLanguage {
                 visualIndices: visualIndices,
                 deepstackEmbeds: deepstackEmbeds)
 
+            let output: MLXArray
             if let lmHead {
-                output = lmHead(output)
+                output = lmHead(hiddenStates)
             } else {
-                output = model.embedTokens.asLinear(output)
+                output = model.embedTokens.asLinear(hiddenStates)
             }
 
-            return LMOutput(logits: output, state: state)
+            return LMOutput(logits: output, hiddenStates: hiddenStates, state: state)
         }
 
     }
@@ -1948,12 +1949,13 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             eval(typedCache)
         }
 
-        let lastLogits = forward(processed ..< remainderLength).logits
+        let last = forward(processed ..< remainderLength)
         prefill.progress?(remainderLength, remainderLength)
 
         return .logits(
             LMOutput(
-                logits: lastLogits,
+                logits: last.logits,
+                hiddenStates: last.hiddenStates,
                 state: QwenVL.continuationResumeState(
                     ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)))
     }
