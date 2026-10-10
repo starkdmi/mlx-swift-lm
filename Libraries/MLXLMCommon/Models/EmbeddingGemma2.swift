@@ -378,7 +378,7 @@ public final class EmbeddingGemma2: Module, BaseLanguageModel {
     /// Keeps the text model and the encoders this configuration loads. PyTorch checkpoints
     /// store convolution kernels channels-first; they move to the channels-last layout
     /// of MLX.
-    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var prefixes = ["language_model."]
         if visionTower != nil { prefixes += ["vision_tower.", "embed_vision."] }
         if audioTower != nil { prefixes += ["audio_tower.", "embed_audio."] }
