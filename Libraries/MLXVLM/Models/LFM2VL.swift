@@ -179,15 +179,23 @@ private enum Vision {
             let scale = Double(input) / Double(output)
             let support = max(scale, 1)
             var weights = [Float](repeating: 0, count: output * input)
+            var row = [Double]()
             for i in 0 ..< output {
                 let center = (Double(i) + 0.5) * scale
-                var row = [Double](repeating: 0, count: input)
-                for j in 0 ..< input {
-                    row[j] = max(0, 1 - abs((Double(j) + 0.5 - center) / support))
+                // Only inputs within `support` of the centre have weight.
+                // Visiting every input made the matrices for a 896-pixel
+                // frame cost a quarter of a second in a Debug build.
+                let first = max(0, Int((center - support - 0.5).rounded(.down)))
+                let last = min(input - 1, Int((center + support - 0.5).rounded(.up)))
+                guard first <= last else { continue }
+                row.removeAll(keepingCapacity: true)
+                for j in first ... last {
+                    row.append(max(0, 1 - abs((Double(j) + 0.5 - center) / support)))
                 }
                 let total = row.reduce(0, +)
-                for j in 0 ..< input where total > 0 {
-                    weights[i * input + j] = Float(row[j] / total)
+                guard total > 0 else { continue }
+                for (offset, weight) in row.enumerated() {
+                    weights[i * input + first + offset] = Float(weight / total)
                 }
             }
             return MLXArray(weights, [output, input])
