@@ -171,7 +171,31 @@ private enum Vision {
                 embeddingCount: numPatches, dimensions: embedDim)
         }
 
-        /// Resize positional embeddings using bicubic interpolation
+        /// Weights `[output, input]` of a one-dimensional antialiased linear
+        /// resize with half-pixel centres: PyTorch's `interpolate(mode:
+        /// "bilinear", align_corners: false, antialias: true)` along one axis.
+        /// Enlarging, it is ordinary bilinear interpolation, edges clamped.
+        static func linearResizeWeights(from input: Int, to output: Int) -> MLXArray {
+            let scale = Double(input) / Double(output)
+            let support = max(scale, 1)
+            var weights = [Float](repeating: 0, count: output * input)
+            for i in 0 ..< output {
+                let center = (Double(i) + 0.5) * scale
+                var row = [Double](repeating: 0, count: input)
+                for j in 0 ..< input {
+                    row[j] = max(0, 1 - abs((Double(j) + 0.5 - center) / support))
+                }
+                let total = row.reduce(0, +)
+                for j in 0 ..< input where total > 0 {
+                    weights[i * input + j] = Float(row[j] / total)
+                }
+            }
+            return MLXArray(weights, [output, input])
+        }
+
+        /// Resize positional embeddings as Siglip2 does: bilinear, antialiased,
+        /// in float32. This was bicubic, which moves every position embedding
+        /// by several percent from the ones the model was trained with.
         static func resizePositionalEmbeddings(
             positionalEmbeddings: MLXArray,
             spatialShapes: MLXArray,
@@ -182,44 +206,39 @@ private enum Vision {
             let srcW = positionalEmbeddings.dim(1)
             let embedDim = positionalEmbeddings.dim(-1)
             let sourceDtype = positionalEmbeddings.dtype
+            let source = positionalEmbeddings.asType(.float32)
 
-            let resultedPositionalEmbeddings = MLXArray.zeros(
-                [batchSize, maxLength, embedDim], dtype: sourceDtype)
-
-            // Reshape from [H, W, embedDim] to [1, embedDim, H, W] once before loop
-            let reshapedEmbeddings =
-                positionalEmbeddings
-                .transposed(2, 0, 1)
-                .reshaped(1, embedDim, srcH, srcW)
-
+            var batch = [MLXArray]()
             for i in 0 ..< batchSize {
-                let shape = spatialShapes[i]
-                let targetH = shape[0].item(Int.self)
-                let targetW = shape[1].item(Int.self)
+                let targetH = spatialShapes[i, 0].item(Int.self)
+                let targetW = spatialShapes[i, 1].item(Int.self)
 
-                // Bicubic interpolation
-                let interpolated = bicubicInterpolate(
-                    reshapedEmbeddings,
-                    size: (targetH, targetW)
+                // Rows, then columns: [srcH, srcW, D] → [targetH, srcW, D] → [targetH, targetW, D]
+                let rows = matmul(
+                    linearResizeWeights(from: srcH, to: targetH),
+                    source.reshaped(srcH, srcW * embedDim)
+                ).reshaped(targetH, srcW, embedDim)
+                let resized = matmul(
+                    linearResizeWeights(from: srcW, to: targetW),
+                    rows.transposed(1, 0, 2).reshaped(srcW, targetH * embedDim)
                 )
+                .reshaped(targetW, targetH, embedDim)
+                .transposed(1, 0, 2)
+                .reshaped(targetH * targetW, embedDim)
+                .asType(sourceDtype)
 
-                // Reshape to [targetH * targetW, embedDim]
-                let resizedEmbeddings =
-                    interpolated
-                    .reshaped(embedDim, targetH * targetW)
-                    .transposed(1, 0)
-
+                // Positions past the crop's patches take the first embedding.
                 let numPositions = targetH * targetW
-                resultedPositionalEmbeddings[i, 0 ..< numPositions] = resizedEmbeddings
-                // Fill remaining positions with the first embedding
                 if numPositions < maxLength {
-                    for j in numPositions ..< maxLength {
-                        resultedPositionalEmbeddings[i, j] = resizedEmbeddings[0]
-                    }
+                    let fill = broadcast(
+                        resized[0 ..< 1], to: [maxLength - numPositions, embedDim])
+                    batch.append(concatenated([resized, fill], axis: 0))
+                } else {
+                    batch.append(resized)
                 }
             }
 
-            return resultedPositionalEmbeddings
+            return stacked(batch, axis: 0)
         }
 
         func callAsFunction(_ pixelValues: MLXArray, spatialShapes: MLXArray) -> MLXArray {
@@ -661,7 +680,21 @@ private class PixelUnshuffleBlock: Module, UnaryLayer {
 
 /// LFM2 VL VLM `UserInputProcessor`.
 ///
-/// This is meant to be used with ``LFM2VL`` and is typically created by ``VLMModelFactory``.
+/// Cuts images as transformers' `Lfm2VlImageProcessor` does. An image of up to
+/// `max_image_tokens` (times `max_pixels_tolerance`) is smart-resized whole:
+/// both sides on a 32-pixel grid, 64–256 tokens. A larger one is resized onto
+/// a grid of 512-pixel tiles chosen by aspect ratio (`min_tiles`–`max_tiles`),
+/// each tile its own crop, with the smart-resized image appended as a
+/// thumbnail. The placeholder becomes `<|image_start|>`, a
+/// `<|img_row_R_col_C|>` before each tile's tokens, `<|img_thumbnail|>` before
+/// the thumbnail's, and `<|image_end|>`.
+///
+/// Until this, every image was stretched onto whole tiles and encoded as one
+/// crop: a 16:9 frame went in as 1024×1024 — 4,096 patches where the encoder
+/// was trained on at most 1,024, its aspect lost — with none of the tokens
+/// that tell the model where a tile sits.
+///
+/// This is typically created by ``VLMModelFactory``.
 public struct LFM2VLProcessor: UserInputProcessor {
     private let config: LFM2VLProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -671,84 +704,228 @@ public struct LFM2VLProcessor: UserInputProcessor {
         self.tokenizer = tokenizer
     }
 
-    /// Preprocess a single image
-    func preprocess(image: CIImage, targetSize: CGSize) -> CIImage {
-        image
-            .toSRGB()
-            .resampled(to: targetSize, method: .bicubic)
-            .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
+    /// One image as the model sees it: its crops in order (tiles row by row,
+    /// then the thumbnail), each `[patches, patch² · 3]` with its patch grid,
+    /// and the token layout of its placeholder.
+    struct Crops {
+        var patches: [MLXArray]
+        var grids: [(height: Int, width: Int)]
+        var rows: Int
+        var columns: Int
+        /// The smart-resized size, in pixels: the whole image, or the thumbnail.
+        var resized: (height: Int, width: Int)
     }
 
-    /// Split an image into patches
-    func splitIntoPatchesAndPreprocess(
-        image: CIImage,
-        processing: UserInput.Processing?
-    ) throws -> (pixels: MLXArray, spatialShape: (Int, Int), pixelAttentionMask: MLXArray) {
-        // Apply user processing if any
-        let image = MediaProcessing.apply(image, processing: processing)
+    /// Python's `round`, which rounds halves to even.
+    static func roundByFactor(_ value: Int, _ factor: Int) -> Int {
+        Int((Double(value) / Double(factor)).rounded(.toNearestOrEven)) * factor
+    }
 
-        // Get image dimensions
-        let width = Int(image.extent.width)
-        let height = Int(image.extent.height)
+    /// `Lfm2VlImageProcessor.smart_resize`: (height, width).
+    func smartResize(height: Int, width: Int) -> (height: Int, width: Int) {
+        let factor = config.encoderPatchSize * config.downsampleFactor
+        let pixelsPerToken = factor * factor
+        let minPixels = config.minImageTokens * pixelsPerToken
+        let maxPixels = config.maxImageTokens * pixelsPerToken
+        var h = max(factor, Self.roundByFactor(height, factor))
+        var w = max(factor, Self.roundByFactor(width, factor))
+        if h * w > maxPixels {
+            let beta = (Double(height * width) / Double(maxPixels)).squareRoot()
+            h = max(factor, Int((Double(height) / beta / Double(factor)).rounded(.down)) * factor)
+            w = max(factor, Int((Double(width) / beta / Double(factor)).rounded(.down)) * factor)
+        } else if h * w < minPixels {
+            let beta = (Double(minPixels) / Double(height * width)).squareRoot()
+            h = Int((Double(height) * beta / Double(factor)).rounded(.up)) * factor
+            w = Int((Double(width) * beta / Double(factor)).rounded(.up)) * factor
+        }
+        return (h, w)
+    }
 
-        // Calculate tile dimensions
-        let tileSize = config.tileSize
-        let patchSize = config.encoderPatchSize
+    /// `Lfm2VlImageProcessor._is_image_too_large`.
+    func isTooLarge(height: Int, width: Int) -> Bool {
+        let factor = config.encoderPatchSize * config.downsampleFactor
+        let h = max(config.encoderPatchSize, Self.roundByFactor(height, factor))
+        let w = max(config.encoderPatchSize, Self.roundByFactor(width, factor))
+        let limit =
+            Double(config.maxImageTokens * factor * factor) * config.maxPixelsTolerance
+        return Double(h * w) > limit
+    }
 
-        // Calculate number of tiles
-        let numTilesH = max(1, min(config.maxTiles, Int(ceil(Double(height) / Double(tileSize)))))
-        let numTilesW = max(1, min(config.maxTiles, Int(ceil(Double(width) / Double(tileSize)))))
-
-        // Calculate actual resize dimensions
-        let resizedHeight = numTilesH * tileSize
-        let resizedWidth = numTilesW * tileSize
-
-        // Resize the image
-        let resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
-        let resizedImage = image.toSRGB().resampled(to: resizedSize, method: .bicubic)
-
-        // Calculate patches per tile
-        let patchesPerTileH = tileSize / patchSize
-        let patchesPerTileW = tileSize / patchSize
-
-        // Total number of patches
-        let totalPatchesH = numTilesH * patchesPerTileH
-        let totalPatchesW = numTilesW * patchesPerTileW
-
-        // Convert to MLXArray and extract patches
-        let normalizedImage = resizedImage.normalized(
-            mean: config.imageMeanTuple, std: config.imageStdTuple)
-        var imageArray = MediaProcessing.asMLXArray(normalizedImage)  // [1, C, H, W]
-
-        // Reshape to extract patches: [1, C, H, W] -> [1, numPatches, patchSize*patchSize*C]
-        imageArray = imageArray.transposed(0, 2, 3, 1)  // [1, H, W, C]
-
-        // Extract patches
-        var patches = [MLXArray]()
-        for ph in 0 ..< totalPatchesH {
-            for pw in 0 ..< totalPatchesW {
-                let startH = ph * patchSize
-                let startW = pw * patchSize
-                let patch = imageArray[
-                    0, startH ..< (startH + patchSize), startW ..< (startW + patchSize), 0...]
-                patches.append(patch.flattened())
+    /// `_get_grid_layout`: the (columns, rows) whose aspect ratio is closest to
+    /// the image's; between equally close ones, the larger grid when the image
+    /// covers more than half of it.
+    func gridLayout(height: Int, width: Int) throws -> (columns: Int, rows: Int) {
+        let minTiles = config.minTiles
+        let maxTiles = config.maxTiles
+        var ratios = Set<[Int]>()
+        // A grid has at least one tile, so `min_tiles` 0 allows what 1 does.
+        if max(1, minTiles) <= maxTiles {
+            for n in max(1, minTiles) ... maxTiles {
+                for w in 1 ... n {
+                    for h in 1 ... n where minTiles <= w * h && w * h <= maxTiles {
+                        ratios.insert([w, h])
+                    }
+                }
             }
         }
+        guard !ratios.isEmpty else {
+            throw VLMError.processing(
+                "No tile grid has between min_tiles \(minTiles) and max_tiles \(maxTiles) tiles.")
+        }
+        // Python sorts a set by product alone, so grids of one product keep
+        // the set's order, which this does not reproduce. With 2–10 tiles, the
+        // checkpoints' range, the order never changes the grid (every size up
+        // to 3000×3000 checked); with min_tiles equal to max_tiles it can.
+        let sorted = ratios.sorted { ($0[0] * $0[1], $0[0]) < ($1[0] * $1[1], $1[0]) }
+        let aspectRatio = Double(width) / Double(height)
+        let area = Double(width * height)
+        let tile = Double(config.tileSize)
+        var best = (columns: 1, rows: 1)
+        var bestDifference = Double.infinity
+        for ratio in sorted {
+            let difference = abs(aspectRatio - Double(ratio[0]) / Double(ratio[1]))
+            if difference < bestDifference {
+                bestDifference = difference
+                best = (ratio[0], ratio[1])
+            } else if difference == bestDifference,
+                area > 0.5 * tile * tile * Double(ratio[0] * ratio[1])
+            {
+                best = (ratio[0], ratio[1])
+            }
+        }
+        return best
+    }
 
-        let pixelValues = stacked(patches, axis: 0).expandedDimensions(axis: 0)  // [1, numPatches, patchDim]
+    /// `[C, H, W]` of the image's 8-bit levels, as PIL hands them to the
+    /// processor.
+    private func levels(_ image: CIImage) -> MLXArray {
+        clip((image.asMLXArray()[0] * 255).round(), min: 0, max: 255)
+    }
 
-        // Create attention mask (all ones for valid patches)
-        let numPatches = totalPatchesH * totalPatchesW
-        let pixelAttentionMask = MLXArray.ones([1, numPatches]).asType(.int32)
+    /// `[C, H, W]` of `levels` resized to `height` × `width` and normalised.
+    ///
+    /// The resize is the processor's: bilinear (`resample: 2`) with
+    /// torchvision's antialiasing, on 8-bit pixels, rounded back to 8 bits.
+    /// It was Core Image's bicubic, which sharpens where the reference
+    /// averages: every tile, thumbnail and single crop differed from what the
+    /// model was trained on. The filter is the position embeddings' own
+    /// (`Vision.VisionEmbeddings.linearResizeWeights`), one matrix per axis,
+    /// on the CPU so no GPU rounds it to TF32.
+    private func pixels(_ levels: MLXArray, height: Int, width: Int) -> MLXArray {
+        var resized = levels
+        if levels.dim(1) != height || levels.dim(2) != width {
+            let rows = Vision.VisionEmbeddings.linearResizeWeights(
+                from: levels.dim(1), to: height)
+            let columns = Vision.VisionEmbeddings.linearResizeWeights(
+                from: levels.dim(2), to: width)
+            // [C, H, W] → [C, height, W] → [C, height, width]
+            let scaled = matmul(
+                matmul(rows, levels, stream: .cpu), columns.transposed(), stream: .cpu)
+            resized = clip(scaled.round(), min: 0, max: 255)
+        }
+        let mean = MLXArray(config.imageMean.map { Float($0) }).reshaped(-1, 1, 1)
+        let std = MLXArray(config.imageStd.map { Float($0) }).reshaped(-1, 1, 1)
+        return (resized / 255 - mean) / std
+    }
 
-        return (pixelValues, (totalPatchesH, totalPatchesW), pixelAttentionMask)
+    /// `convert_image_to_patches`: `[C, H, W]` → `[patches, p · p · C]`, row by row.
+    private func patches(_ pixels: MLXArray) -> (MLXArray, (height: Int, width: Int)) {
+        let p = config.encoderPatchSize
+        let (c, h, w) = (pixels.dim(0), pixels.dim(1), pixels.dim(2))
+        let patches =
+            pixels
+            .reshaped(c, h / p, p, w / p, p)
+            .transposed(1, 3, 2, 4, 0)
+            .reshaped((h / p) * (w / p), p * p * c)
+        return (patches, (h / p, w / p))
+    }
+
+    func crops(_ image: CIImage, processing: UserInput.Processing?) throws -> Crops {
+        let image = MediaProcessing.apply(image, processing: processing).toSRGB()
+        let height = Int(image.extent.height.rounded())
+        let width = Int(image.extent.width.rounded())
+        // A strip resized by `processing` can round to no pixels at all.
+        guard height > 0, width > 0 else {
+            throw VLMError.processing("The image is \(width)×\(height) pixels.")
+        }
+        let levels = levels(image)
+        let resized = smartResize(height: height, width: width)
+        let splits = config.doImageSplitting && !(config.minTiles == 1 && config.maxTiles == 1)
+
+        guard splits, isTooLarge(height: height, width: width) else {
+            let (patches, grid) = patches(
+                pixels(levels, height: resized.height, width: resized.width))
+            return Crops(
+                patches: [patches], grids: [grid], rows: 1, columns: 1, resized: resized)
+        }
+
+        let tile = config.tileSize
+        let layout = try gridLayout(height: height, width: width)
+        let canvas = pixels(levels, height: tile * layout.rows, width: tile * layout.columns)
+        var crops = Crops(
+            patches: [], grids: [], rows: layout.rows, columns: layout.columns, resized: resized)
+        for row in 0 ..< layout.rows {
+            for column in 0 ..< layout.columns {
+                let (patches, grid) = patches(
+                    canvas[
+                        0..., (row * tile) ..< ((row + 1) * tile),
+                        (column * tile) ..< ((column + 1) * tile)])
+                crops.patches.append(patches)
+                crops.grids.append(grid)
+            }
+        }
+        if config.useThumbnail && layout.rows * layout.columns != 1 {
+            let (patches, grid) = patches(
+                pixels(levels, height: resized.height, width: resized.width))
+            crops.patches.append(patches)
+            crops.grids.append(grid)
+        }
+        return crops
+    }
+
+    /// `Lfm2VlProcessor._build_image_tokens`, as token ids.
+    func placeholder(for crops: Crops, imageTokenId: Int) throws -> [Int] {
+        func id(_ token: String) throws -> Int {
+            guard let id = tokenizer.convertTokenToId(token) else {
+                throw VLMError.processing("The tokenizer has no '\(token)' token.")
+            }
+            return id
+        }
+        let special = config.useImageSpecialTokens
+        let downsample = config.downsampleFactor
+        let patch = config.encoderPatchSize
+        func tokens(_ size: (height: Int, width: Int)) -> Int {
+            let h = Int((Double(size.height / patch) / Double(downsample)).rounded(.up))
+            let w = Int((Double(size.width / patch) / Double(downsample)).rounded(.up))
+            return h * w
+        }
+
+        var ids = [Int]()
+        if special { ids.append(try id("<|image_start|>")) }
+        if crops.rows > 1 || crops.columns > 1 {
+            let perTile = tokens((config.tileSize, config.tileSize))
+            for row in 0 ..< crops.rows {
+                for column in 0 ..< crops.columns {
+                    if special { ids.append(try id("<|img_row_\(row + 1)_col_\(column + 1)|>")) }
+                    ids += Array(repeating: imageTokenId, count: perTile)
+                }
+            }
+            if config.useThumbnail {
+                if special { ids.append(try id("<|img_thumbnail|>")) }
+                ids += Array(repeating: imageTokenId, count: tokens(crops.resized))
+            }
+        } else {
+            ids += Array(repeating: imageTokenId, count: tokens(crops.resized))
+        }
+        if special { ids.append(try id("<|image_end|>")) }
+        return ids
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = Qwen2VLMessageGenerator().generate(
             from: input.removingSpecialTokenLabels(using: tokenizer))
 
-        var promptTokens = try tokenizer.applyChatTemplate(
+        let promptTokens = try tokenizer.applyChatTemplate(
             messages: messages,
             tools: input.tools,
             additionalContext: input.additionalContext
@@ -759,31 +936,10 @@ public struct LFM2VLProcessor: UserInputProcessor {
             return LMInput(tokens: MLXArray(promptTokens))
         }
 
-        // Process images
-        var allPixelValues = [MLXArray]()
-        var allSpatialShapes = [(Int, Int)]()
-        var allPixelAttentionMasks = [MLXArray]()
-
-        for imageInput in input.images {
-            let image = try imageInput.asCIImage()
-            let (pixels, spatialShape, pixelAttentionMask) = try splitIntoPatchesAndPreprocess(
-                image: image, processing: input.processing)
-            allPixelValues.append(pixels)
-            allSpatialShapes.append(spatialShape)
-            allPixelAttentionMasks.append(pixelAttentionMask)
+        let images = try input.images.map {
+            try crops(try $0.asCIImage(), processing: input.processing)
         }
 
-        // Calculate how many image tokens we need per image
-        let downsampleFactor = config.downsampleFactor
-        var totalImageTokens = 0
-        for shape in allSpatialShapes {
-            let h = shape.0 / downsampleFactor
-            let w = shape.1 / downsampleFactor
-            totalImageTokens += h * w
-        }
-
-        // Replace image placeholder tokens with the correct count.
-        //
         // The id is per-model, not per-family: 396 is LFM2-VL's, while
         // LFM2.5-VL-3B declares 124907. Hardcoding it meant the expansion below
         // scanned for a token the template never emitted, left the single
@@ -792,54 +948,45 @@ public struct LFM2VLProcessor: UserInputProcessor {
         // The vocabulary is the authority; the old constant stays as the
         // fallback for a tokenizer with no `<image>` entry.
         let imageTokenId = tokenizer.convertTokenToId("<image>") ?? 396
-        var newPromptTokens = [Int]()
-        var imageIdx = 0
-        var i = 0
-        while i < promptTokens.count {
-            if promptTokens[i] == imageTokenId {
-                // Count consecutive image tokens
-                var count = 0
-                while i + count < promptTokens.count && promptTokens[i + count] == imageTokenId {
-                    count += 1
-                }
-                // Replace with correct number for this image
-                if imageIdx < allSpatialShapes.count {
-                    let shape = allSpatialShapes[imageIdx]
-                    let h = shape.0 / downsampleFactor
-                    let w = shape.1 / downsampleFactor
-                    let numTokens = h * w
-                    for _ in 0 ..< numTokens {
-                        newPromptTokens.append(imageTokenId)
-                    }
-                    imageIdx += 1
-                }
-                i += count
+        var expanded = [Int]()
+        var imageIndex = 0
+        for token in promptTokens {
+            if token == imageTokenId, imageIndex < images.count {
+                expanded += try placeholder(for: images[imageIndex], imageTokenId: imageTokenId)
+                imageIndex += 1
             } else {
-                newPromptTokens.append(promptTokens[i])
-                i += 1
+                expanded.append(token)
             }
         }
-        promptTokens = newPromptTokens
 
-        // Concatenate all image data
-        let pixelValuesConcatenated = concatenated(allPixelValues, axis: 0)
+        // Crops differ in length (a thumbnail is smaller than a tile), so they
+        // are padded to the longest; the model encodes each crop at its own
+        // length from `frames`, and never sees the padding.
+        let patches: [MLXArray] = images.flatMap(\.patches)
+        let grids: [(height: Int, width: Int)] = images.flatMap(\.grids)
+        let longest = patches.map { $0.dim(0) }.max() ?? 0
+        var batch = [MLXArray]()
+        for crop in patches {
+            if crop.dim(0) == longest {
+                batch.append(crop)
+            } else {
+                let widths: [IntOrPair] = [.init((0, longest - crop.dim(0))), .init((0, 0))]
+                batch.append(padded(crop, widths: widths))
+            }
+        }
 
-        // Convert spatial shapes to THW format (t=1 for images)
-        let frames = allSpatialShapes.map { THW(1, $0.0, $0.1) }
-
-        let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
+        let promptArray = MLXArray(expanded).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
             image: LMInput.ProcessedImage(
-                pixels: pixelValuesConcatenated,
-                frames: frames
+                pixels: stacked(batch, axis: 0),
+                frames: grids.map { THW(1, $0.height, $0.width) }
             )
         )
     }
 }
-
 // MARK: - Model
 
 /// LFM2 VL VLM
@@ -897,45 +1044,46 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             inputsEmbeds = inputsEmbeds.expandedDimensions(axis: 0)
         }
 
-        guard let pixelValues, let spatialShapes, let pixelAttentionMask else {
+        guard let pixelValues, let spatialShapes, pixelAttentionMask != nil else {
             return inputsEmbeds
         }
 
-        // Get the output hidden states from the vision model
-        let visionOutput = visionModel(
-            pixelValues, outputHiddenStates: true, spatialShapes: spatialShapes)
-        let hiddenStates = visionOutput.lastHiddenState
-
-        // Get feature lengths from attention mask
-        let imgFeatureLengths = sum(pixelAttentionMask, axis: 1)
-
+        // Each crop is encoded at its own length. Crops are padded to the
+        // longest, and the encoder takes no mask: a thumbnail encoded beside
+        // full tiles attended to its padding. Runs of crops of one shape — a
+        // row of tiles — are encoded as a batch.
+        let shapes = (0 ..< spatialShapes.dim(0)).map {
+            (spatialShapes[$0, 0].item(Int.self), spatialShapes[$0, 1].item(Int.self))
+        }
         var imageFeatures = [MLXArray]()
+        var start = 0
+        while start < shapes.count {
+            var end = start + 1
+            while end < shapes.count && shapes[end] == shapes[start] { end += 1 }
+            let (featureOrgH, featureOrgW) = shapes[start]
+            let length = featureOrgH * featureOrgW
+            let hiddenStates = visionModel(
+                pixelValues[start ..< end, 0 ..< length], outputHiddenStates: true,
+                spatialShapes: spatialShapes[start ..< end]
+            ).lastHiddenState
 
-        for imgIdx in 0 ..< hiddenStates.dim(0) {
-            var feature = hiddenStates[imgIdx]
-            let featureLength = imgFeatureLengths[imgIdx].item(Int.self)
+            for index in 0 ..< (end - start) {
+                // Reshape to spatial dimensions
+                var feature = hiddenStates[index].reshaped(1, featureOrgH, featureOrgW, -1)
 
-            // Slice to valid features
-            feature = feature[0 ..< featureLength].expandedDimensions(axis: 0)
+                // Apply pixel unshuffle if configured
+                if let pixelUnshuffle {
+                    feature = pixelUnshuffle(feature)
+                }
 
-            // Get spatial dimensions
-            let featureOrgH = spatialShapes[imgIdx, 0].item(Int.self)
-            let featureOrgW = spatialShapes[imgIdx, 1].item(Int.self)
+                // Project to language model dimension
+                var imgEmbedding = multiModalProjector(feature)
 
-            // Reshape to spatial dimensions
-            feature = feature.reshaped(1, featureOrgH, featureOrgW, -1)
-
-            // Apply pixel unshuffle if configured
-            if let pixelUnshuffle {
-                feature = pixelUnshuffle(feature)
+                // Flatten back
+                imgEmbedding = imgEmbedding.reshaped(-1, imgEmbedding.dim(-1))
+                imageFeatures.append(imgEmbedding)
             }
-
-            // Project to language model dimension
-            var imgEmbedding = multiModalProjector(feature)
-
-            // Flatten back
-            imgEmbedding = imgEmbedding.reshaped(-1, imgEmbedding.dim(-1))
-            imageFeatures.append(imgEmbedding)
+            start = end
         }
 
         let concatenatedImageFeatures = concatenated(imageFeatures, axis: 0)
@@ -1095,6 +1243,16 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         var sanitizedWeights = [String: MLXArray]()
         for (k, v) in weights {
             let newKey = transformKey(k)
+
+            // LFM2.5-VL-450M's checkpoints carry a projector LayerNorm their
+            // config turns off (`projector_use_layernorm: false`); transformers
+            // and mlx-vlm drop it, and loading it failed on a module that is
+            // not there.
+            if !config.projectorUseLayernorm
+                && newKey.hasPrefix("multi_modal_projector.layer_norm.")
+            {
+                continue
+            }
 
             // Handle conv weight transposition
             var value = v
@@ -1276,9 +1434,16 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
     private let _tileSize: Int?
     private let _encoderPatchSize: Int?
     private let _maxTiles: Int?
+    private let _minTiles: Int?
     private let _downsampleFactor: Int?
+    private let _doImageSplitting: Bool?
+    private let _useThumbnail: Bool?
+    private let _minImageTokens: Int?
+    private let _maxImageTokens: Int?
+    private let _maxPixelsTolerance: Double?
+    private let _useImageSpecialTokens: Bool?
 
-    // Default values matching LFM2 VL models
+    // Defaults are transformers' `Lfm2VlImageProcessor` and `Lfm2VlProcessor`.
     public var imageMean: [CGFloat] {
         _imageMean ?? [0.5, 0.5, 0.5]
     }
@@ -1288,7 +1453,16 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
     public var tileSize: Int { _tileSize ?? 512 }
     public var encoderPatchSize: Int { _encoderPatchSize ?? 16 }
     public var maxTiles: Int { _maxTiles ?? 10 }
+    public var minTiles: Int { _minTiles ?? 2 }
     public var downsampleFactor: Int { _downsampleFactor ?? 2 }
+    public var doImageSplitting: Bool { _doImageSplitting ?? true }
+    public var useThumbnail: Bool { _useThumbnail ?? true }
+    public var minImageTokens: Int { _minImageTokens ?? 64 }
+    public var maxImageTokens: Int { _maxImageTokens ?? 256 }
+    public var maxPixelsTolerance: Double { _maxPixelsTolerance ?? 2.0 }
+    /// Kept in `processor_config.json`, which is not read; on by default, as
+    /// in transformers.
+    public var useImageSpecialTokens: Bool { _useImageSpecialTokens ?? true }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
         (imageMean[0], imageMean[1], imageMean[2])
@@ -1303,7 +1477,14 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
         case _tileSize = "tile_size"
         case _encoderPatchSize = "encoder_patch_size"
         case _maxTiles = "max_tiles"
+        case _minTiles = "min_tiles"
         case _downsampleFactor = "downsample_factor"
+        case _doImageSplitting = "do_image_splitting"
+        case _useThumbnail = "use_thumbnail"
+        case _minImageTokens = "min_image_tokens"
+        case _maxImageTokens = "max_image_tokens"
+        case _maxPixelsTolerance = "max_pixels_tolerance"
+        case _useImageSpecialTokens = "use_image_special_tokens"
     }
 }
 
